@@ -1,0 +1,13 @@
+{
+  "name": "api-monitor",
+  "version": "1.0.0",
+  "description": "A small dependency-free API monitoring and rate limiting gateway.",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

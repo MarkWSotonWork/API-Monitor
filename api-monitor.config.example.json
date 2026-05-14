@@ -1,0 +1,33 @@
+{
+  "port": 7934,
+  "upstreamBaseUrl": "http://127.0.0.1:7935",
+  "publicBaseUrl": "http://10.1.2.4:7934",
+  "adminKey": "change-me",
+  "https": {
+    "enabled": false,
+    "keyPath": "certs/localhost-key.pem",
+    "certPath": "certs/localhost-cert.pem"
+  },
+  "corsAllowedOrigins": [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://10.1.2.4:3000",
+    "http://10.1.2.4:3001",
+    "http://10.1.2.4:7934",
+    "https://localhost:3000",
+    "https://127.0.0.1:3000",
+    "https://10.1.2.4:3000",
+    "https://10.1.2.4:3001",
+    "https://10.1.2.4:7934"
+  ],
+  "defaultLimit": {
+    "windowSeconds": 60,
+    "maxRequests": 60
+  },
+  "clientLimits": {
+    "demo-key": {
+      "windowSeconds": 60,
+      "maxRequests": 10
+    }
+  }
+}
