@@ -1,7 +1,7 @@
 import http from "node:http";
 import https from "node:https";
-import { createHash } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -24,6 +24,11 @@ const defaultLimit = {
   maxRequests: numberFromEnv("RATE_LIMIT_MAX", config.defaultLimit?.maxRequests ?? 60)
 };
 const clientLimits = config.clientLimits ?? {};
+const upstreamTimeoutMs = numberFromEnv("UPSTREAM_TIMEOUT_SECONDS", config.upstreamTimeoutSeconds ?? 30) * 1000;
+const upstreamMaxRetries = nonNegativeIntegerFromEnv("UPSTREAM_MAX_RETRIES", config.upstreamMaxRetries ?? 2);
+const logMaxBytes = numberFromEnv("LOG_MAX_BYTES", config.logMaxBytes ?? 10_000_000);
+const logMaxArchives = nonNegativeIntegerFromEnv("LOG_MAX_ARCHIVES", config.logMaxArchives ?? 5);
+const maxRequestBodyBytes = numberFromEnv("MAX_REQUEST_BODY_BYTES", config.maxRequestBodyBytes ?? 10_485_760);
 const httpsConfig = config.https ?? {};
 const listenProtocol = httpsConfig.enabled ? "https" : "http";
 const corsAllowedOrigins = config.corsAllowedOrigins ?? [
@@ -31,10 +36,31 @@ const corsAllowedOrigins = config.corsAllowedOrigins ?? [
   "http://127.0.0.1:3000"
 ];
 
+for (const origin of corsAllowedOrigins) {
+  try {
+    const parsed = new URL(origin);
+    if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("bad protocol");
+  } catch {
+    console.error(`Invalid CORS origin (must be http/https URL): ${origin}`);
+    process.exit(1);
+  }
+}
+
 if (!upstreamBaseUrl) {
   console.error(
     "Missing upstream API. Set UPSTREAM_BASE_URL or create api-monitor.config.json."
   );
+  process.exit(1);
+}
+
+try {
+  const parsed = new URL(upstreamBaseUrl);
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    console.error(`upstreamBaseUrl must use http or https, got: ${parsed.protocol}`);
+    process.exit(1);
+  }
+} catch {
+  console.error(`upstreamBaseUrl is not a valid URL: ${upstreamBaseUrl}`);
   process.exit(1);
 }
 
@@ -44,9 +70,18 @@ if (publicBaseUrl && sameOrigin(publicBaseUrl, upstreamBaseUrl)) {
   );
 }
 
-mkdirSync(dataDir, { recursive: true });
-const logStream = createWriteStream(logPath, { flags: "a" });
+mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+let logBytesWritten = existsSync(logPath) ? statSync(logPath).size : 0;
 const limitWindows = new Map();
+const cleanupIntervalMs = 5 * 60 * 1000;
+const cleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [clientId, window] of limitWindows) {
+    if (now >= window.resetAt) {
+      limitWindows.delete(clientId);
+    }
+  }
+}, cleanupIntervalMs).unref();
 const eventClients = new Set();
 const recentEvents = [];
 
@@ -70,6 +105,7 @@ const server = createAppServer(async (req, res) => {
 
     const clientIdentity = getClientIdentity(req);
     const clientId = clientIdentity.id;
+    const clientIp = getClientIp(req);
     const limit = limitForClient(clientIdentity);
     const decision = checkLimit(clientId, limit);
 
@@ -78,6 +114,7 @@ const server = createAppServer(async (req, res) => {
       const event = {
         timestamp: new Date().toISOString(),
         clientId,
+        clientIp,
         method: req.method,
         path: requestUrl.pathname,
         query: requestUrl.search,
@@ -109,6 +146,7 @@ const server = createAppServer(async (req, res) => {
     writeEvent({
       timestamp: new Date().toISOString(),
       clientId,
+      clientIp,
       method: req.method,
       path: requestUrl.pathname,
       query: requestUrl.search,
@@ -121,9 +159,15 @@ const server = createAppServer(async (req, res) => {
       totalBytes: proxyResult.totalBytes
     });
   } catch (error) {
+    if (error.code === "PAYLOAD_TOO_LARGE") {
+      sendJson(res, 413, { error: "payload_too_large" }, { "Connection": "close" });
+      return;
+    }
+
     writeEvent({
       timestamp: new Date().toISOString(),
       clientId: getClientId(req),
+      clientIp: getClientIp(req),
       method: req.method,
       path: requestUrl.pathname,
       query: requestUrl.search,
@@ -136,7 +180,7 @@ const server = createAppServer(async (req, res) => {
       totalBytes: estimateRequestBytes(req),
       error: error.message
     });
-    sendJson(res, 502, { error: "upstream_error", message: error.message });
+    sendJson(res, 502, { error: "upstream_error" });
   }
 });
 
@@ -161,6 +205,29 @@ server.listen(port, () => {
   console.log(`Proxying requests to ${upstreamBaseUrl}`);
   console.log(`Usage log: ${logPath}`);
 });
+
+function shutdown() {
+  console.log("Shutting down...");
+  clearInterval(cleanupTimer);
+
+  for (const client of eventClients) {
+    client.end();
+  }
+  eventClients.clear();
+
+  server.close(() => {
+    console.log("Shutdown complete.");
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    console.error("Forced exit after timeout.");
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
 function createAppServer(handler) {
   if (!httpsConfig.enabled) {
@@ -202,7 +269,12 @@ function loadConfig() {
     return {};
   }
 
-  return JSON.parse(readFileSync(configPath, "utf8"));
+  try {
+    return JSON.parse(readFileSync(configPath, "utf8"));
+  } catch (err) {
+    console.error(`Invalid JSON in ${configPath}: ${err.message}`);
+    process.exit(1);
+  }
 }
 
 function numberFromEnv(name, fallback) {
@@ -219,8 +291,26 @@ function numberFromEnv(name, fallback) {
   return parsed;
 }
 
+function nonNegativeIntegerFromEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") {
+    return fallback;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer.`);
+  }
+
+  return parsed;
+}
+
 function getClientId(req) {
   return getClientIdentity(req).id;
+}
+
+function getClientIp(req) {
+  return req.socket.remoteAddress ?? "unknown";
 }
 
 function getClientIdentity(req) {
@@ -244,10 +334,12 @@ function getClientIdentity(req) {
   const forwardedFor = headerValue(req, "x-forwarded-for");
   if (forwardedFor) {
     const forwardedClient = forwardedFor.split(",")[0].trim();
-    return {
-      id: forwardedClient,
-      legacyId: forwardedClient
-    };
+    if (forwardedClient) {
+      return {
+        id: forwardedClient,
+        legacyId: forwardedClient
+      };
+    }
   }
 
   const socketClient = req.socket.remoteAddress ?? "unknown";
@@ -325,12 +417,12 @@ async function proxyToUpstream(req, res, requestUrl, limit, decision) {
     headers.set("content-length", String(body.length));
   }
 
-  const upstreamResponse = await fetch(targetUrl, {
+  const upstreamResponse = await fetchWithResilience(targetUrl, {
     method: req.method,
     headers,
     body: body.length === 0 || ["GET", "HEAD"].includes(req.method ?? "") ? undefined : body,
     redirect: "manual"
-  });
+  }, req.method);
 
   let responseBuffer = Buffer.from(await upstreamResponse.arrayBuffer());
   const rewritten = rewriteOpenApiResponse(req, requestUrl, upstreamResponse, responseBuffer);
@@ -436,6 +528,33 @@ function copyProxyHeaders(req) {
   return headers;
 }
 
+async function fetchWithResilience(url, options, method) {
+  const retryable = ["GET", "HEAD"].includes(method ?? "");
+  let lastError;
+
+  for (let attempt = 0; attempt <= (retryable ? upstreamMaxRetries : 0); attempt++) {
+    if (attempt > 0) {
+      await new Promise(r => setTimeout(r, 250 * attempt));
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), upstreamTimeoutMs);
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timer);
+      if (retryable && attempt < upstreamMaxRetries && [502, 503, 504].includes(response.status)) {
+        lastError = new Error(`upstream ${response.status}`);
+        continue;
+      }
+      return response;
+    } catch (err) {
+      clearTimeout(timer);
+      lastError = err.name === "AbortError" ? new Error(`upstream timeout after ${upstreamTimeoutMs}ms`) : err;
+      if (!retryable || attempt === upstreamMaxRetries) throw lastError;
+    }
+  }
+  throw lastError;
+}
+
 const hopByHopHeaders = new Set([
   "connection",
   "keep-alive",
@@ -450,11 +569,46 @@ const hopByHopHeaders = new Set([
 
 function readRequestBody(req) {
   return new Promise((resolveBody, rejectBody) => {
+    const declaredLength = Number(headerValue(req, "content-length") ?? 0);
+    if (Number.isFinite(declaredLength) && declaredLength > maxRequestBodyBytes) {
+      req.resume();
+      rejectBody(payloadTooLargeError());
+      return;
+    }
+
     const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => resolveBody(Buffer.concat(chunks)));
-    req.on("error", rejectBody);
+    let totalBytes = 0;
+    let rejected = false;
+    req.on("data", (chunk) => {
+      if (rejected) {
+        return;
+      }
+
+      totalBytes += chunk.length;
+      if (totalBytes > maxRequestBodyBytes) {
+        rejected = true;
+        chunks.length = 0;
+        req.resume();
+        rejectBody(payloadTooLargeError());
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (!rejected) {
+        resolveBody(Buffer.concat(chunks));
+      }
+    });
+    req.on("error", (error) => {
+      if (!rejected) {
+        rejectBody(error);
+      }
+    });
   });
+}
+
+function payloadTooLargeError() {
+  return Object.assign(new Error("request body too large"), { code: "PAYLOAD_TOO_LARGE" });
 }
 
 async function handleMonitorRequest(req, res, requestUrl) {
@@ -492,7 +646,12 @@ async function handleMonitorRequest(req, res, requestUrl) {
   }
 
   if (requestUrl.pathname === "/_monitor/usage") {
-    sendJson(res, 200, usageSummary(requestUrl));
+    const result = usageSummary(requestUrl);
+    if (result.error) {
+      sendJson(res, 400, result);
+    } else {
+      sendJson(res, 200, result);
+    }
     return;
   }
 
@@ -509,13 +668,21 @@ function isAdminAuthorized(req) {
     return true;
   }
 
-  return headerValue(req, "x-admin-key") === adminKey;
+  const provided = headerValue(req, "x-admin-key") ?? "";
+  if (provided.length !== adminKey.length) return false;
+  return timingSafeEqual(Buffer.from(provided), Buffer.from(adminKey));
 }
 
 function usageSummary(requestUrl) {
   const since = requestUrl.searchParams.get("since");
   const clientFilter = requestUrl.searchParams.get("clientId");
-  const sinceTime = since ? Date.parse(since) : 0;
+  let sinceTime = 0;
+  if (since) {
+    sinceTime = Date.parse(since);
+    if (Number.isNaN(sinceTime)) {
+      return { error: "invalid_since", message: "since must be a valid ISO 8601 date" };
+    }
+  }
   const summary = {
     since: since || null,
     totalCalls: 0,
@@ -591,8 +758,35 @@ function addBytes(target, key, bytesReceived, bytesSent, totalBytes) {
   target[key] = current;
 }
 
+function rotateLog() {
+  if (!existsSync(logPath)) {
+    logBytesWritten = 0;
+    return;
+  }
+
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const rotated = resolve(dataDir, `api-calls-${ts}.jsonl`);
+  renameSync(logPath, rotated);
+
+  const archives = readdirSync(dataDir)
+    .filter(f => /^api-calls-.*\.jsonl$/.test(f))
+    .sort();
+  while (archives.length > logMaxArchives) {
+    rmSync(resolve(dataDir, archives.shift()));
+  }
+
+  logBytesWritten = 0;
+}
+
 function writeEvent(event) {
-  logStream.write(`${JSON.stringify(event)}\n`);
+  const line = `${JSON.stringify(event)}\n`;
+  const lineBytes = Buffer.byteLength(line);
+  if (logBytesWritten > 0 && logBytesWritten + lineBytes > logMaxBytes) {
+    rotateLog();
+  }
+  appendFileSync(logPath, line, { mode: 0o600 });
+  logBytesWritten += lineBytes;
+
   recentEvents.push(event);
   if (recentEvents.length > 100) {
     recentEvents.shift();
@@ -756,6 +950,34 @@ function dashboardHtml() {
       color: var(--danger);
       font-weight: 700;
     }
+    .summary-total {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-top: 12px;
+      padding: 14px 16px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .summary-title {
+      font-size: 15px;
+      font-weight: 700;
+    }
+    .summary-items {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(90px, 1fr));
+      gap: 14px;
+      min-width: min(100%, 560px);
+    }
+    .summary-item {
+      text-align: right;
+    }
+    .summary-item strong {
+      display: block;
+      font-size: 18px;
+    }
     @media (max-width: 760px) {
       header {
         align-items: stretch;
@@ -763,6 +985,17 @@ function dashboardHtml() {
       }
       .stats {
         grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .summary-total {
+        align-items: stretch;
+        flex-direction: column;
+      }
+      .summary-items {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        min-width: 0;
+      }
+      .summary-item {
+        text-align: left;
       }
       input, button {
         width: 100%;
@@ -796,6 +1029,7 @@ function dashboardHtml() {
           <tr>
             <th style="width: 180px">Time</th>
             <th style="width: 110px">Client</th>
+            <th style="width: 120px">IP</th>
             <th style="width: 80px">Status</th>
             <th>Path</th>
             <th style="width: 100px">Data</th>
@@ -804,6 +1038,15 @@ function dashboardHtml() {
         </thead>
         <tbody id="events"></tbody>
       </table>
+    </section>
+    <section class="summary-total" aria-label="Summary totals">
+      <div class="summary-title">Summary Totals</div>
+      <div class="summary-items">
+        <div class="summary-item"><span class="label">Calls</span><strong id="bottomTotal">0</strong></div>
+        <div class="summary-item"><span class="label">Limited</span><strong id="bottomLimited">0</strong></div>
+        <div class="summary-item"><span class="label">Errors</span><strong id="bottomErrors">0</strong></div>
+        <div class="summary-item"><span class="label">Data</span><strong id="bottomDataUsed">0 B</strong></div>
+      </div>
     </section>
   </main>
   <script>
@@ -901,6 +1144,7 @@ function dashboardHtml() {
       row.innerHTML = [
         cell(new Date(event.timestamp).toLocaleTimeString()),
         cell(event.clientId),
+        cell(event.clientIp),
         cell(event.statusCode),
         cell(event.path + (event.query || "")),
         cell(formatBytes(event.totalBytes ?? ((event.bytesReceived ?? 0) + (event.bytesSent ?? 0)))),
@@ -932,6 +1176,10 @@ function dashboardHtml() {
       document.getElementById("limited").textContent = state.limited;
       document.getElementById("errors").textContent = state.errors;
       document.getElementById("dataUsed").textContent = formatBytes(state.totalBytes);
+      document.getElementById("bottomTotal").textContent = state.total;
+      document.getElementById("bottomLimited").textContent = state.limited;
+      document.getElementById("bottomErrors").textContent = state.errors;
+      document.getElementById("bottomDataUsed").textContent = formatBytes(state.totalBytes);
     }
 
     function formatBytes(bytes) {

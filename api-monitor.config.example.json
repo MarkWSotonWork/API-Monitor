@@ -3,6 +3,11 @@
   "upstreamBaseUrl": "http://127.0.0.1:7935",
   "publicBaseUrl": "http://10.1.2.4:7934",
   "adminKey": "change-me",
+  "upstreamTimeoutSeconds": 30,
+  "upstreamMaxRetries": 2,
+  "logMaxBytes": 10000000,
+  "logMaxArchives": 5,
+  "maxRequestBodyBytes": 10485760,
   "https": {
     "enabled": false,
     "keyPath": "certs/localhost-key.pem",

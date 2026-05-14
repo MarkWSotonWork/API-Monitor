@@ -2,6 +2,8 @@
 
 A small dependency-free Node.js gateway for monitoring API calls, tracking usage, and limiting request volume per client.
 
+This repository is a **Node.js API gateway / proxy service** that forwards requests to an upstream API, applies client-specific rate limits, records usage metrics, and exposes admin monitoring endpoints.
+
 ## What it does
 
 - Proxies API requests to an upstream API.
@@ -28,6 +30,11 @@ Edit `api-monitor.config.json`:
   "upstreamBaseUrl": "http://127.0.0.1:7935",
   "publicBaseUrl": "http://10.1.2.4:7934",
   "adminKey": "change-me",
+  "upstreamTimeoutSeconds": 30,
+  "upstreamMaxRetries": 2,
+  "logMaxBytes": 10000000,
+  "logMaxArchives": 5,
+  "maxRequestBodyBytes": 10485760,
   "https": {
     "enabled": false,
     "keyPath": "certs/localhost-key.pem",
@@ -65,6 +72,11 @@ Environment variables can override the main settings:
 - `ADMIN_KEY`
 - `RATE_LIMIT_WINDOW_SECONDS`
 - `RATE_LIMIT_MAX`
+- `UPSTREAM_TIMEOUT_SECONDS`
+- `UPSTREAM_MAX_RETRIES`
+- `LOG_MAX_BYTES`
+- `LOG_MAX_ARCHIVES`
+- `MAX_REQUEST_BODY_BYTES`
 
 ## Run
 
