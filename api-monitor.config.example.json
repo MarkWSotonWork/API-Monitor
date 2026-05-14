@@ -5,6 +5,7 @@
   "adminKey": "change-me",
   "upstreamTimeoutSeconds": 30,
   "upstreamMaxRetries": 2,
+  "upstreamHealthPath": "/",
   "logMaxBytes": 10000000,
   "logMaxArchives": 5,
   "maxRequestBodyBytes": 10485760,

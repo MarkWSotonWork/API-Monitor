@@ -32,6 +32,7 @@ Edit `api-monitor.config.json`:
   "adminKey": "change-me",
   "upstreamTimeoutSeconds": 30,
   "upstreamMaxRetries": 2,
+  "upstreamHealthPath": "/",
   "logMaxBytes": 10000000,
   "logMaxArchives": 5,
   "maxRequestBodyBytes": 10485760,
@@ -74,6 +75,7 @@ Environment variables can override the main settings:
 - `RATE_LIMIT_MAX`
 - `UPSTREAM_TIMEOUT_SECONDS`
 - `UPSTREAM_MAX_RETRIES`
+- `UPSTREAM_HEALTH_PATH`
 - `LOG_MAX_BYTES`
 - `LOG_MAX_ARCHIVES`
 - `MAX_REQUEST_BODY_BYTES`
@@ -155,8 +157,15 @@ If `adminKey` is configured, include `x-admin-key` on these requests.
 
 ```powershell
 Invoke-RestMethod http://10.1.2.4:7934/_monitor/health -Headers @{ "x-admin-key" = "change-me" }
+Invoke-RestMethod http://10.1.2.4:7934/_monitor/upstream-health -Headers @{ "x-admin-key" = "change-me" }
 Invoke-RestMethod http://10.1.2.4:7934/_monitor/limits -Headers @{ "x-admin-key" = "change-me" }
 Invoke-RestMethod http://10.1.2.4:7934/_monitor/usage -Headers @{ "x-admin-key" = "change-me" }
+```
+
+Shut the monitor down cleanly:
+
+```powershell
+Invoke-RestMethod http://10.1.2.4:7934/_monitor/shutdown -Method Post -Headers @{ "x-admin-key" = "change-me" }
 ```
 
 Filter usage:

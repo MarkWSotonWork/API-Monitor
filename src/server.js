@@ -26,6 +26,7 @@ const defaultLimit = {
 const clientLimits = config.clientLimits ?? {};
 const upstreamTimeoutMs = numberFromEnv("UPSTREAM_TIMEOUT_SECONDS", config.upstreamTimeoutSeconds ?? 30) * 1000;
 const upstreamMaxRetries = nonNegativeIntegerFromEnv("UPSTREAM_MAX_RETRIES", config.upstreamMaxRetries ?? 2);
+const upstreamHealthPath = process.env.UPSTREAM_HEALTH_PATH ?? config.upstreamHealthPath ?? "/";
 const logMaxBytes = numberFromEnv("LOG_MAX_BYTES", config.logMaxBytes ?? 10_000_000);
 const logMaxArchives = nonNegativeIntegerFromEnv("LOG_MAX_ARCHIVES", config.logMaxArchives ?? 5);
 const maxRequestBodyBytes = numberFromEnv("MAX_REQUEST_BODY_BYTES", config.maxRequestBodyBytes ?? 10_485_760);
@@ -84,6 +85,7 @@ const cleanupTimer = setInterval(() => {
 }, cleanupIntervalMs).unref();
 const eventClients = new Set();
 const recentEvents = [];
+let isShuttingDown = false;
 
 const server = createAppServer(async (req, res) => {
   const startedAt = Date.now();
@@ -207,6 +209,11 @@ server.listen(port, () => {
 });
 
 function shutdown() {
+  if (isShuttingDown) {
+    return;
+  }
+
+  isShuttingDown = true;
   console.log("Shutting down...");
   clearInterval(cleanupTimer);
 
@@ -555,6 +562,45 @@ async function fetchWithResilience(url, options, method) {
   throw lastError;
 }
 
+async function checkUpstreamHealth() {
+  const startedAt = Date.now();
+  const healthUrl = new URL(upstreamHealthPath, upstreamBaseUrl);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), upstreamTimeoutMs);
+
+  try {
+    const response = await fetch(healthUrl, {
+      method: "HEAD",
+      redirect: "manual",
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+
+    const reachable = response.status < 500;
+    return {
+      status: reachable ? "ok" : "unhealthy",
+      reachable,
+      upstreamBaseUrl,
+      healthUrl: healthUrl.toString(),
+      statusCode: response.status,
+      durationMs: Date.now() - startedAt,
+      checkedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    clearTimeout(timer);
+    return {
+      status: "unhealthy",
+      reachable: false,
+      upstreamBaseUrl,
+      healthUrl: healthUrl.toString(),
+      statusCode: null,
+      durationMs: Date.now() - startedAt,
+      checkedAt: new Date().toISOString(),
+      error: error.name === "AbortError" ? `timeout after ${upstreamTimeoutMs}ms` : error.message
+    };
+  }
+}
+
 const hopByHopHeaders = new Set([
   "connection",
   "keep-alive",
@@ -622,13 +668,31 @@ async function handleMonitorRequest(req, res, requestUrl) {
     return;
   }
 
+  if (requestUrl.pathname === "/_monitor/shutdown") {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { error: "method_not_allowed" }, { "Allow": "POST" });
+      return;
+    }
+
+    sendJson(res, 202, { status: "shutting_down" });
+    setTimeout(shutdown, 50).unref();
+    return;
+  }
+
   if (requestUrl.pathname === "/_monitor/health") {
     sendJson(res, 200, {
       status: "ok",
       upstreamBaseUrl,
+      upstreamHealthPath,
       logPath,
       defaultLimit
     });
+    return;
+  }
+
+  if (requestUrl.pathname === "/_monitor/upstream-health") {
+    const result = await checkUpstreamHealth();
+    sendJson(res, result.reachable ? 200 : 503, result);
     return;
   }
 
@@ -902,6 +966,10 @@ function dashboardHtml() {
       border-color: var(--accent);
       cursor: pointer;
     }
+    button.danger {
+      background: var(--danger);
+      border-color: var(--danger);
+    }
     .stats {
       display: grid;
       grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -928,6 +996,22 @@ function dashboardHtml() {
     .status {
       color: var(--muted);
       font-size: 14px;
+    }
+    .health-line {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-top: 4px;
+    }
+    .health-value {
+      font-weight: 700;
+    }
+    .health-ok {
+      color: var(--accent);
+    }
+    .health-bad {
+      color: var(--danger);
     }
     table {
       width: 100%;
@@ -967,9 +1051,9 @@ function dashboardHtml() {
     }
     .summary-items {
       display: grid;
-      grid-template-columns: repeat(4, minmax(90px, 1fr));
+      grid-template-columns: repeat(6, minmax(90px, 1fr));
       gap: 14px;
-      min-width: min(100%, 560px);
+      min-width: min(100%, 760px);
     }
     .summary-item {
       text-align: right;
@@ -1008,11 +1092,14 @@ function dashboardHtml() {
     <div>
       <h1>API Monitor</h1>
       <div class="status" id="status">Disconnected</div>
+      <div class="status health-line">Live API: <span class="health-value" id="upstreamHealth">Unknown</span></div>
     </div>
     <div class="controls">
       <input id="adminKey" type="password" placeholder="Admin key" autocomplete="current-password">
+      <button id="checkApi">Check API</button>
       <button id="connect">Connect</button>
       <button id="clear">Clear</button>
+      <button class="danger" id="stop">Stop</button>
     </div>
   </header>
   <main>
@@ -1046,22 +1133,31 @@ function dashboardHtml() {
         <div class="summary-item"><span class="label">Limited</span><strong id="bottomLimited">0</strong></div>
         <div class="summary-item"><span class="label">Errors</span><strong id="bottomErrors">0</strong></div>
         <div class="summary-item"><span class="label">Data</span><strong id="bottomDataUsed">0 B</strong></div>
+        <div class="summary-item"><span class="label">Avg Calls/Min</span><strong id="bottomAvgCalls">0</strong></div>
+        <div class="summary-item"><span class="label">Avg Data/Min</span><strong id="bottomAvgData">0 B</strong></div>
       </div>
     </section>
   </main>
   <script>
-    const state = { total: 0, limited: 0, errors: 0, totalBytes: 0, abort: null };
+    const state = { total: 0, limited: 0, errors: 0, totalBytes: 0, firstEventAt: null, lastEventAt: null, abort: null };
     const statusEl = document.getElementById("status");
+    const upstreamHealthEl = document.getElementById("upstreamHealth");
     const eventsEl = document.getElementById("events");
 
+    document.getElementById("checkApi").addEventListener("click", checkApi);
     document.getElementById("connect").addEventListener("click", connect);
     document.getElementById("clear").addEventListener("click", clearEvents);
+    document.getElementById("stop").addEventListener("click", stopMonitor);
+
+    checkApi();
 
     function clearEvents() {
       state.total = 0;
       state.limited = 0;
       state.errors = 0;
       state.totalBytes = 0;
+      state.firstEventAt = null;
+      state.lastEventAt = null;
       document.getElementById("lastStatus").textContent = "-";
       eventsEl.textContent = "";
       renderStats();
@@ -1115,6 +1211,58 @@ function dashboardHtml() {
       }
     }
 
+    async function checkApi() {
+      const adminKey = document.getElementById("adminKey").value;
+      upstreamHealthEl.className = "health-value";
+      upstreamHealthEl.textContent = "Checking";
+
+      try {
+        const response = await fetch(new URL("/_monitor/upstream-health", window.location.origin), {
+          headers: { "x-admin-key": adminKey }
+        });
+        if (response.status === 401) {
+          upstreamHealthEl.className = "health-value health-bad";
+          upstreamHealthEl.textContent = "Enter admin key";
+          return;
+        }
+        const result = await response.json();
+        upstreamHealthEl.className = "health-value " + (result.reachable ? "health-ok" : "health-bad");
+        upstreamHealthEl.textContent = result.reachable
+          ? "Up (" + result.statusCode + ", " + result.durationMs + " ms)"
+          : "Down (" + (result.error || ("HTTP " + result.statusCode)) + ")";
+      } catch (error) {
+        upstreamHealthEl.className = "health-value health-bad";
+        upstreamHealthEl.textContent = "Check failed";
+      }
+    }
+
+    async function stopMonitor() {
+      const adminKey = document.getElementById("adminKey").value;
+      if (!window.confirm("Stop API Monitor?")) {
+        return;
+      }
+
+      statusEl.textContent = "Stopping";
+      try {
+        const response = await fetch(new URL("/_monitor/shutdown", window.location.origin), {
+          method: "POST",
+          headers: { "x-admin-key": adminKey }
+        });
+
+        if (!response.ok) {
+          statusEl.textContent = "Stop failed: HTTP " + response.status;
+          return;
+        }
+
+        if (state.abort) {
+          state.abort.abort();
+        }
+        statusEl.textContent = "Stopped";
+      } catch (error) {
+        statusEl.textContent = "Stop requested";
+      }
+    }
+
     function handleSseMessage(message) {
       const dataLine = message.split("\\n").find((line) => line.startsWith("data: "));
       if (!dataLine) {
@@ -1125,6 +1273,12 @@ function dashboardHtml() {
     }
 
     function addEvent(event) {
+      const eventTime = Date.parse(event.timestamp);
+      const timestamp = Number.isFinite(eventTime) ? eventTime : Date.now();
+      if (state.firstEventAt === null) {
+        state.firstEventAt = timestamp;
+      }
+      state.lastEventAt = timestamp;
       state.total += 1;
       if (event.limited) {
         state.limited += 1;
@@ -1180,6 +1334,30 @@ function dashboardHtml() {
       document.getElementById("bottomLimited").textContent = state.limited;
       document.getElementById("bottomErrors").textContent = state.errors;
       document.getElementById("bottomDataUsed").textContent = formatBytes(state.totalBytes);
+      document.getElementById("bottomAvgCalls").textContent = formatRate(averageCallsPerMinute());
+      document.getElementById("bottomAvgData").textContent = formatBytes(averageDataPerMinute());
+    }
+
+    function averageCallsPerMinute() {
+      if (!state.total || state.firstEventAt === null || state.lastEventAt === null) {
+        return 0;
+      }
+
+      const elapsedMs = Math.max(60_000, state.lastEventAt - state.firstEventAt);
+      return state.total / (elapsedMs / 60_000);
+    }
+
+    function averageDataPerMinute() {
+      if (!state.totalBytes || state.firstEventAt === null || state.lastEventAt === null) {
+        return 0;
+      }
+
+      const elapsedMs = Math.max(60_000, state.lastEventAt - state.firstEventAt);
+      return state.totalBytes / (elapsedMs / 60_000);
+    }
+
+    function formatRate(value) {
+      return value >= 10 ? value.toFixed(1) : value.toFixed(2);
     }
 
     function formatBytes(bytes) {
