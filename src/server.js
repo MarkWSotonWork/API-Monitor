@@ -930,6 +930,7 @@ function dashboardHtml() {
       margin: 0;
       background: var(--bg);
       color: var(--text);
+      padding-bottom: 92px;
     }
     header, main {
       max-width: 1120px;
@@ -1039,11 +1040,24 @@ function dashboardHtml() {
       align-items: center;
       justify-content: space-between;
       gap: 16px;
-      margin-top: 12px;
+      position: fixed;
+      left: 50%;
+      right: auto;
+      bottom: 0;
+      z-index: 10;
+      width: calc(100% - 36px);
+      max-width: 1120px;
+      box-sizing: border-box;
+      margin: 0;
       padding: 14px 16px;
       background: var(--panel);
       border: 1px solid var(--border);
+      border-bottom: 0;
       border-radius: 8px;
+      border-bottom-left-radius: 0;
+      border-bottom-right-radius: 0;
+      box-shadow: 0 -8px 20px rgba(0, 0, 0, 0.08);
+      transform: translateX(-50%);
     }
     .summary-title {
       font-size: 15px;
@@ -1083,6 +1097,9 @@ function dashboardHtml() {
       }
       input, button {
         width: 100%;
+      }
+      body {
+        padding-bottom: 150px;
       }
     }
   </style>
